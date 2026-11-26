@@ -1,0 +1,15 @@
+name = "emerging-restaurants"
+description = "Emerging restaurant, beverage and experiential concepts and early-stage franchisors with viral demand, strong unit economics and a credible unit pipeline."
+geo = "United States"
+revenue_band = [5_000_000, 150_000_000]
+model = "restaurant"
+keywords = ["best new fast casual chain", "best boba chain", "fastest growing coffee chain"]
+ai_prompts = [
+  "What are the fastest-growing emerging restaurant chains in the US right now?",
+  "Which new coffee or drink chains are people most excited about?",
+  "What are the best emerging franchise brands to invest in?",
+]
+[pillar_weights]
+heat = 1.4
+velocity = 1.4
+financial = 1.2

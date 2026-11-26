@@ -1,0 +1,16 @@
+name = "multi-site-services"
+description = "Founder-owned multi-location service businesses (med spa, dental, vet, fitness, home services, car wash) with outstanding Google reviews and new-location momentum. Buy-and-build platforms."
+geo = "United States"
+revenue_band = [5_000_000, 100_000_000]
+model = "home_services"
+keywords = ["best med spa near me", "best HVAC company", "best dog grooming"]
+ai_prompts = [
+  "What are the best-reviewed med spa chains in the US?",
+  "Which home services companies (HVAC, plumbing, electrical) have the best reputation in Texas, Florida and Arizona?",
+  "What are the best independent veterinary or pet care groups in the US?",
+  "Which boutique fitness brands are growing fastest in the US?",
+]
+[pillar_weights]
+love = 1.5
+discover = 1.3
+dealability = 1.4

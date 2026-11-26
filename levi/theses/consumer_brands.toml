@@ -1,0 +1,16 @@
+name = "consumer-brands"
+description = "Founder-led consumer brands (food & bev, beauty, personal care, pet, home) with viral demand and expanding retail distribution."
+geo = "United States"
+revenue_band = [10_000_000, 150_000_000]
+model = "dtc_consumer"
+keywords = ["best healthy snack brand", "best clean beauty brand", "best dog treats brand"]
+ai_prompts = [
+  "What are the best up-and-coming healthy snack brands in the US right now?",
+  "Which indie skincare brands are people most excited about right now?",
+  "What are the best new better-for-you beverage brands?",
+  "What are the most popular premium pet food or treat brands that are not owned by big companies?",
+]
+[pillar_weights]
+heat = 1.4
+love = 1.2
+velocity = 1.3

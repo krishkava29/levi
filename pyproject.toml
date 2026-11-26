@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "levi"
+version = "0.1.0"
+description = "Levi: a momentum-first deal sourcing agent for private equity. Finds businesses by their characteristics before they show up on anyone's EBITDA screen."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = []  # stdlib only on purpose: installs anywhere, no supply-chain surface
+
+[project.scripts]
+levi = "levi.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["levi*"]
+
+[tool.setuptools.package-data]
+levi = ["theses/*.toml", "schemas/*.json"]

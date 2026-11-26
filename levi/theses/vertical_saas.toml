@@ -1,0 +1,16 @@
+name = "vertical-saas"
+description = "Bootstrapped or lightly funded vertical software and tech-enabled services for SMB verticals (trades, healthcare practices, restaurants, legal, construction, logistics)."
+geo = "United States"
+revenue_band = [5_000_000, 80_000_000]
+model = "vertical_saas"
+keywords = ["best software for plumbing business", "best dental practice management software", "best construction project management software small business"]
+ai_prompts = [
+  "What is the best software for running a small HVAC or plumbing business?",
+  "What practice management software do independent dental offices like best?",
+  "What's the best all-in-one software for a small restaurant?",
+  "What software do small law firms recommend for case management?",
+]
+[pillar_weights]
+love = 1.3
+discover = 1.4
+velocity = 1.2
