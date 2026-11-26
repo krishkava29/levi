@@ -218,6 +218,9 @@ class Levi:
 
         own = (g("ownership") or "").lower()
         if own:
+            # "no VC", "explicitly no PE", "without venture capital" must not read as institutional
+            own = re.sub(r"\b(no|not|never|without|explicitly no)\s+(outside\s+)?(vc|pe|private equity|venture|"
+                         r"institutional|investors?|funding|equity)\b", " ", own)
             founder = any(w in own for w in ("founder", "family", "bootstrap", "self-funded"))
             institutional = any(w in own for w in ("pe_backed", "vc_backed", "private equity", "strategic", "public",
                                                    "acquired", "vc", "venture", "growth-backed", "series"))
