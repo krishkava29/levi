@@ -1,0 +1,43 @@
+[
+  {
+    "name": "Hounds Town USA",
+    "website": "https://houndstownusa.com",
+    "business_model": "franchisor",
+    "thesis": "multi-site-services",
+    "revenue": {
+      "value_usd": 3386658,
+      "type": "reported",
+      "period": "FY2023",
+      "published_at": "2024-04-20",
+      "source_url": "https://www.nasaaefd.org/Franchise/Actions/DownloadFile.ashx?DocId=147497&isRegistered=true",
+      "passage": "Item 21, Exhibit B, p. B-7, audited Statements of Operations for the franchisor Hounds Town USA, LLC. FY2023 operating revenue was $3,386,658. It comprises $1,384,395 in royalties, $1,532,204 in initial franchise fees, $385,908 in marketing fees, and $84,151 in technology fees."
+    },
+    "locations": {
+      "count": 55,
+      "period": "2023-12-31",
+      "published_at": "2024-04-20",
+      "source_url": "https://www.nasaaefd.org/Franchise/Actions/DownloadFile.ashx?DocId=147497&isRegistered=true",
+      "passage": "Item 19 opening paragraph. The full network had 55 open outlets on December 31, 2023, comprising 54 franchised and one affiliate-owned outlet."
+    },
+    "additional_claims": [
+      {
+        "signal": "Outlet reporting group",
+        "value": 37,
+        "kind": "reported",
+        "period": "FY2023",
+        "published_at": "2024-04-20",
+        "source_url": "https://www.nasaaefd.org/Franchise/Actions/DownloadFile.ashx?DocId=147497&isRegistered=true",
+        "passage": "Item 19 financial performance representations use an unaudited group of 37 outlets (36 franchised, one affiliate-owned) open for at least 12 months. A franchisee did not provide data for Table 11."
+      },
+      {
+        "signal": "Franchisor net loss USD",
+        "value": -735854,
+        "kind": "reported",
+        "period": "FY2023",
+        "published_at": "2024-04-20",
+        "source_url": "https://www.nasaaefd.org/Franchise/Actions/DownloadFile.ashx?DocId=147497&isRegistered=true",
+        "passage": "Item 21, Exhibit B, p. B-7, audited Statements of Operations of the franchisor Hounds Town USA, LLC. FY2023 net loss was $735,854."
+      }
+    ]
+  }
+]

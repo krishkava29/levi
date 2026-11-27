@@ -171,7 +171,7 @@ SIGNALS: list[Signal] = [
     S("fragmented_market", "dealability", "Fragmented market (buy-and-build)",
       "Platform potential: many sub-scale peers to bolt on.", "LLM / thesis config.", "llm", "ratio", 0.0, 1.0, 1.0),
     # ---------------------------------------------------------------- financial
-    S("revenue_fit", "financial", "Estimated revenue in fund's band",
+    S("revenue_fit", "financial", "Estimated revenue fit to fund band",
       "Triangulated estimate (headcount, units x AUV, reviews, disclosed bands) vs thesis band.",
       "levi.financials triangulation.", "llm", "ratio", 0.0, 1.0, 2.0),
     S("revenue_confidence", "financial", "Confidence in revenue estimate",

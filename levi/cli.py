@@ -11,7 +11,8 @@
   levi score [--thesis T]             recompute scores (zero tokens)
   levi top [--thesis T] [--by alpha]  leaderboard
   levi show <company> [--md]          full dossier
-  levi memo <company>                 screening memo (LLM)
+  levi evidence <company>            claims, citations, and missing evidence
+  levi memo <company>                challenge and screening memo (LLM)
   levi export --csv FILE              export leaderboard
   levi watch [--thesis T]             re-collect signals and report movers (run on a schedule)
   levi status <company> <state>       pipeline state: new|watching|contacted|passed|pipeline
@@ -23,11 +24,13 @@ import argparse
 import json
 import shutil
 import sys
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 from .config import Settings
+from .llm import BudgetExceeded, LLMError
 from .pipeline import Levi, list_theses, load_thesis
-from .report import dossier_md, leaderboard_rows, table, to_csv
+from .report import dossier_md, evidence_md, leaderboard_rows, table, to_csv
 from .signals import PILLARS, by_pillar
 
 
@@ -124,10 +127,21 @@ def cmd_show(a):
     print(dossier_md(d) if a.md else json.dumps(d, indent=2, default=str))
 
 
+def cmd_evidence(a):
+    levi = _levi(a)
+    row = _company(levi, a.company)
+    cutoff = datetime.combine(a.as_of, time.max, timezone.utc).timestamp() if a.as_of else None
+    evidence = levi.evidence(row["id"], as_of=cutoff)
+    print(json.dumps(evidence, indent=2) if a.json else evidence_md(evidence))
+
+
 def cmd_memo(a):
     levi = _levi(a)
     cid = _company(levi, a.company)["id"]
-    levi.memo(cid)
+    try:
+        levi.memo(cid)
+    except (LLMError, BudgetExceeded) as error:
+        sys.exit(str(error))
     print(dossier_md(levi.dossier(cid)))
 
 
@@ -152,7 +166,8 @@ def cmd_watch(a):
                     key=lambda x: abs(x[0]), reverse=True)
     for delta, r in movers[:15]:
         if abs(delta) >= a.min_delta:
-            print(f"{'UP  ' if delta > 0 else 'DOWN'} {delta:+5.1f}  {r['name']}  (alpha {r['alpha']})")
+            print(f"{'UP  ' if delta > 0 else 'DOWN'} {delta:+5.1f}  {r['name']}  "
+                  f"(Alpha {r['alpha']}, experimental)")
 
 
 def cmd_status(a):
@@ -197,6 +212,9 @@ def main(argv=None):
     add("score", cmd_score, T, BY, LIM)
     add("top", cmd_top, T, BY, LIM, (["--json"], {"action": "store_true"}))
     add("show", cmd_show, (["company"], {}), (["--md"], {"action": "store_true"}))
+    add("evidence", cmd_evidence, (["company"], {}), (["--json"], {"action": "store_true"}),
+        (["--as-of"], {"type": date.fromisoformat, "metavar": "YYYY-MM-DD",
+                      "help": "Use only evidence available by the end of this UTC date"}))
     add("memo", cmd_memo, (["company"], {}))
     add("export", cmd_export, (["--csv"], {"required": True}), T, BY)
     add("watch", cmd_watch, T, (["--min-delta"], {"type": float, "default": 2.0}))

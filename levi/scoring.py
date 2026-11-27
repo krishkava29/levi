@@ -1,8 +1,7 @@
 """Turn raw signal values into pillar scores, a Levi Score, and a Levi Alpha.
 
 Levi Score (0-100): how attractive the business looks on characteristics.
-Levi Alpha (0-100): Levi Score discounted by how *known* the company already is to
-                    institutional buyers. High alpha = great company nobody is calling yet.
+Levi Alpha (0-100, experimental): Levi Score discounted for institutional awareness and ownership.
 Trajectory fit:     a company under the fund's revenue floor still scores if its
                     growth puts it inside the band within ~24 months - that is the
                     whole point of hunting characteristics instead of EBITDA.
@@ -28,6 +27,7 @@ class ScoreCard:
     pillars: dict
     contributions: list  # (signal_id, normalised, weight) sorted by impact
     missing: list
+    alpha_breakdown: dict
 
     def top_reasons(self, n: int = 4) -> list[str]:
         good = [c for c in self.contributions if c[1] >= 0.66]
@@ -111,11 +111,14 @@ def score(values: dict, pillar_weights: dict | None = None) -> ScoreCard:
     aware = BY_ID["institutional_awareness"].normalise(values.get("institutional_awareness"))
     founder = values.get("founder_owned")
     unknown_factor = aware if aware is not None else 0.6  # 1 = unknown to buyers
-    alpha = s * (0.5 + 0.5 * unknown_factor)
-    if founder is False:
-        alpha *= 0.6
+    unawareness_factor = 0.5 + 0.5 * unknown_factor
+    founder_factor = 0.6 if founder is False else 1.0
+    fit = s * 100
 
     return ScoreCard(
-        score=round(s * 100, 1), alpha=round(alpha * 100, 1), coverage=round(coverage, 3),
+        score=round(fit, 1), alpha=round(fit * unawareness_factor * founder_factor, 1),
+        coverage=round(coverage, 3),
         pillars=pillars, contributions=contributions, missing=missing,
+        alpha_breakdown={"fit": fit, "institutional_unawareness_factor": unawareness_factor,
+                         "founder_factor": founder_factor},
     )

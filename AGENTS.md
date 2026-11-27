@@ -21,7 +21,7 @@ and it leaves an audit trail in `~/.levi/levi.db`.
 
 - Never invent revenue, EBITDA or ownership. Private-company financials are **estimates**. Always show
   Levi's range, its confidence and the methods behind it, and label the P&L as industry-benchmarked.
-- Prefer companies with `founder_owned=true` and low `institutional_awareness`. That is the "Levi Alpha".
+- Prefer companies with `founder_owned=true` and low `institutional_awareness`. That is the "Levi Alpha" (experimental).
 - Respect the user's token budget. Use `--max-llm-calls` to cap a run, and don't enrich more companies
   than the user needs.
 - Cite sources (URLs) for every factual claim you repeat to the user.

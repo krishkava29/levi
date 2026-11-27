@@ -6,12 +6,13 @@
  -> score                                      0 tokens
  -> enrich (LLM+web) top-K only                1 call / shortlisted company
  -> financials triangulation                   0 tokens
- -> score again, memo (LLM) top-N only         1 call / finalist
+ -> score again, challenge + memo (LLM)        2 calls / finalist
 """
 from __future__ import annotations
 
 import json
 import re
+import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -20,12 +21,16 @@ from . import collectors as C
 from . import prompts as P
 from .config import Settings
 from .db import DB, slugify
+from .evidence import (CITED_REVENUE, JUDGMENTS, KINDS, evidence_summary, financial_input_error, iso_time,
+                       publication_date, signal_error, source_url, valid_number)
 from .financials import triangulate
 from .http import Http
 from .llm import LLM, BudgetExceeded, LLMError
 from .scoring import bayesian_rating, revenue_fit, score
+from .signals import BY_ID
 
 THESIS_DIR = Path(__file__).parent / "theses"
+VELOCITIES = {"social_growth_90d": ("social_followers", 90), "review_velocity": ("review_count", 30)}
 
 
 def load_thesis(name_or_path: str) -> dict:
@@ -114,9 +119,12 @@ class Levi:
                         ranks.append(i + 1)
                         break
             sov = hits / len(answers)
-            self.db.snap(row["id"], "ai_share_of_voice", sov, source=self.llm.backend)
+            self.db.record_claim(row["id"], "ai_share_of_voice", sov, kind="measured", source=self.llm.backend,
+                                 passage=f"Recommended in {hits} of {len(answers)} model responses.", snapshot=True)
             if ranks:
-                self.db.snap(row["id"], "ai_rank", sum(ranks) / len(ranks), source=self.llm.backend)
+                self.db.record_claim(row["id"], "ai_rank", sum(ranks) / len(ranks), kind="measured",
+                                     source=self.llm.backend, passage=f"Recommendation positions: {ranks}.",
+                                     snapshot=True)
             result[row["name"]] = sov
         # names the AI recommends that we don't track yet are free discovery leads
         known = {r["name"].lower() for r in self.db.companies()}
@@ -132,7 +140,9 @@ class Levi:
 
         def run(fn, *a):
             try:
-                return fn(*a)
+                with self.http.capture_retrievals() as times:
+                    values, raw = fn(*a)
+                return values, raw | ({"retrieved_at": max(times)} if times else {})
             except Exception as e:  # a broken collector must never kill a run
                 return {}, {"error": f"{fn.__name__}: {e}"}
 
@@ -147,24 +157,42 @@ class Levi:
                 "trends": ex.submit(run, C.trends, self.http, self.s.serpapi_key, name),
             }
             results = {k: f.result() for k, f in fut.items() if f}
-        raw_all = {k: v[1] for k, v in results.items()}
-        for k, (vals, _) in results.items():
-            found.update(vals)
-        ats = raw_all.get("website", {}).get("ats")
+        ats = results.get("website", ({}, {}))[1].get("ats")
         if ats:
-            vals, raw = run(C.jobs, self.http, tuple(ats))
-            found.update(vals)
-            raw_all["jobs"] = raw
-        counts = [raw_all.get("hn", {}).get("hn_hits"), raw_all.get("reddit", {}).get("reddit_posts_12m")]
-        if any(c is not None for c in counts):  # only when a source actually answered
-            found["community_mentions"] = sum(c or 0 for c in counts)
+            results["jobs"] = run(C.jobs, self.http, tuple(ats))
         thesis = self._thesis_for(row)
         if self.s.serpapi_key and thesis.get("keywords"):
-            vals, raw = run(C.serp_rank, self.http, self.s.serpapi_key, C.domain_of(site), thesis["keywords"])
-            found.update(vals)
-            raw_all["serp"] = raw
-        for sid, v in found.items():
-            self.db.snap(cid, sid, v, source="free")
+            results["serp"] = run(C.serp_rank, self.http, self.s.serpapi_key, C.domain_of(site), thesis["keywords"])
+        raw_all = {k: v[1] for k, v in results.items()}
+        community = []
+        for collector, (values, raw) in results.items():
+            url = raw.get("source_url")
+            retrieved_at = raw.get("retrieved_at", time.time())
+            observed = dict(values)
+            if collector == "website" and url:
+                observed.update({k: raw[k] for k in ("socials", "ats", "site_rating", "address", "location_links",
+                                                     "has_careers") if raw.get(k) is not None})
+            for key in ("first_archived", "hn_hits", "reddit_posts_12m", "places_found", "trend_series"):
+                if key in raw and url:
+                    observed[key] = raw[key]
+            passage = json.dumps({k: v for k, v in raw.items()
+                                  if k not in {"source_url", "period", "retrieved_at", "text"}})
+            for sid, value in observed.items():
+                numeric = sid in values or sid in {"hn_hits", "reddit_posts_12m"}
+                rejection = signal_error(sid, value) if numeric else None
+                claim_id = self.db.record_claim(cid, sid, value, kind="measured", source=collector, source_url=url,
+                                                period=raw.get("period") or iso_time(retrieved_at),
+                                                retrieved_at=retrieved_at, passage=passage, snapshot=sid in values,
+                                                rejection=rejection)
+                if sid in {"hn_hits", "reddit_posts_12m"} and not rejection:
+                    community.append((claim_id, value))
+                if sid in values and not rejection:
+                    found[sid] = value
+        if community:
+            found["community_mentions"] = sum(value for _, value in community)
+            self.db.record_claim(cid, "community_mentions", found["community_mentions"], kind="measured",
+                                 source="community aggregation", inputs=tuple(i for i, _ in community),
+                                 passage="Sum of available Hacker News and Reddit measurements.", snapshot=True)
         self.db.snap(cid, "_raw_free", None, raw={k: {kk: vv for kk, vv in v.items() if kk != "text"}
                                                   for k, v in raw_all.items()}, source="free")
         prof = {"socials": raw_all.get("website", {}).get("socials"),
@@ -174,22 +202,45 @@ class Levi:
         self._velocity(cid)
         return found
 
+    def evidence(self, cid: int, *, as_of: float | None = None) -> dict:
+        row = self.db.latest_score(cid) if as_of is None else None
+        return self._evidence(cid, row, as_of=as_of)
+
+    def _evidence(self, cid: int, row, *, as_of: float | None = None, reviewed_ids: tuple[int, ...] = ()) -> dict:
+        scorecard = json.loads(row["card"]) if row else {}
+        evidence = evidence_summary(self.db.claims(cid, as_of=as_of), scorecard.get("evidence_ids", []), reviewed_ids)
+        evidence["validation_issues"].extend(scorecard.get("validation_issues", []))
+        if row and "evidence_ids" not in scorecard:
+            evidence["validation_issues"].append("Legacy score has no pinned evidence. Re-run levi score.")
+        return evidence
+
     def _velocity(self, cid: int) -> None:
         """Turn repeated snapshots into growth signals (the reason to keep watching)."""
-        for level, growth, per_month in (("social_followers", "social_growth_90d", False),
-                                         ("review_count", "review_velocity", True),
-                                         ("open_roles", None, False)):
-            h = self.db.history(cid, level)
-            if len(h) < 2:
+        for growth, (level, days_scaled) in VELOCITIES.items():
+            history = [r for r in self.db.snapshot_history(cid, level) if r["value"] is not None]
+            if len(history) < 2:
                 continue
-            (t0, v0), (t1, v1) = h[0], h[-1]
+            end = history[-1]
+            def scope(row):
+                query = json.loads(row["passage"]).get("query") if row["source"] == "places" and row["passage"] else None
+                return row["source"], row["source_url"], query
+
+            if not end["source_url"]:
+                continue
+            comparable = [r for r in history if scope(r) == scope(end)]
+            start = min(comparable, key=lambda r: r["retrieved_at"] or r["ts"])
+            t0, t1 = (r["retrieved_at"] or r["ts"] for r in (start, end))
+            v0, v1 = start["value"], end["value"]
             days = (t1 - t0) / 86400
-            if days < 7 or not v0:
+            if days < 7 or (not v0 and days_scaled == 90):
                 continue
-            if growth and not per_month:
-                self.db.snap(cid, growth, (v1 / v0 - 1) * (90 / days), source="derived")
-            elif growth:
-                self.db.snap(cid, growth, (v1 - v0) / days * 30, source="derived")
+            change = (v1 / v0 - 1) if days_scaled == 90 else (v1 - v0)
+            period = f"{iso_time(t0)}/{iso_time(t1)}"
+            inputs = tuple(self._claim_for_snapshot(cid, r) for r in (start, end))
+            self.db.record_claim(cid, growth, change * days_scaled / days, kind="measured", source="derived",
+                                 period=period, inputs=inputs,
+                                 passage=f"{level} changed from {v0:g} to {v1:g}. Scaled to {days_scaled} days.",
+                                 snapshot=True)
 
     # ------------------------------------------------------------------ LLM enrichment (shortlist)
     def enrich(self, cid: int) -> dict:
@@ -198,102 +249,221 @@ class Levi:
         ctx = json.dumps({k: v for k, v in have.items() if not k.startswith("_")}, default=str)
         out = self.llm.ask(P.enrich_prompt(row["name"], row["website"], ctx), P.ENRICH_SCHEMA,
                            purpose="enrich", tier="deep", web=True, system=P.SYSTEM)
+        if not isinstance(out, dict):
+            raise LLMError("Enrichment did not return a fact sheet")
+        rejections = self._apply_facts(cid, out, source="llm")
+        self._velocity(cid)
+        profile = dict(out)
+        if rejections:
+            profile["rejected_claims"] = rejections
         self.db.upsert_company({"name": row["name"], "website": out.get("website"), "city": out.get("hq_city"),
                                 "state": out.get("hq_state"), "category": out.get("category"),
                                 "model": out.get("business_model"), "ownership": out.get("ownership"),
-                                "profile": {"enrichment": out}})
-        self._apply_facts(cid, out, source="llm")
-        return out
+                                "profile": {"enrichment": profile}})
+        return profile
 
-    def _apply_facts(self, cid: int, f: dict, source: str) -> None:
-        """Map a researched fact sheet (enrichment or seed) onto signals."""
-        def g(*keys):
-            for k in keys:
-                cur = f
-                for part in k.split("."):
-                    cur = cur.get(part) if isinstance(cur, dict) else None
-                if cur not in (None, "", []) and not isinstance(cur, dict):
-                    return cur
-            return None
+    def _apply_facts(self, cid: int, facts: dict, source: str) -> list[dict]:
+        """Map a fact sheet onto individually cited observations and scoring inputs."""
+        offered = facts.get("evidence")
+        evidence = {e["signal"]: e for e in (offered if isinstance(offered, list) else [])
+                    if isinstance(e, dict) and isinstance(e.get("signal"), str)}
+        rejected = []
 
-        own = (g("ownership") or "").lower()
-        if own:
-            # "no VC", "explicitly no PE", "without venture capital" must not read as institutional
-            own = re.sub(r"\b(no|not|never|without|explicitly no)\s+(outside\s+)?(vc|pe|private equity|venture|"
-                         r"institutional|investors?|funding|equity)\b", " ", own)
-            founder = any(w in own for w in ("founder", "family", "bootstrap", "self-funded"))
-            institutional = any(w in own for w in ("pe_backed", "vc_backed", "private equity", "strategic", "public",
-                                                   "acquired", "vc", "venture", "growth-backed", "series"))
-            if institutional or founder:  # ambiguous ownership stays unknown rather than penalised
-                self.db.snap(cid, "founder_owned", founder and not institutional, source=source)
-        mapping = {
-            "capital_raised": g("capital_raised_usd"),
-            "employees": g("employees", "employees.value"),
-            "new_locations_12m": g("new_locations_or_doors_12m"),
-            "social_followers": g("social_followers_total"),
-            "press_velocity": g("press_mentions_6m"),
-            "awards": g("has_growth_award"),
-            "institutional_awareness": g("institutional_awareness"),
-            "succession_signal": g("succession_signal"),
-            "fragmented_market": g("fragmented_market"),
-            "product_talkability": g("product_talkability"),
-            "recurring_model": g("recurring_model"),
-            "category_tailwind": g("category_tailwind"),
-            "pricing_power": g("pricing_power"),
-            "fad_risk": g("fad_risk"),
-            "legal_regulatory": g("legal_regulatory"),
-            "key_person": g("key_person"),
-            "revenue_growth": g("growth_rate_estimate"),
-        }
-        if not mapping["social_followers"]:
-            soc = f.get("social") or {}
-            tot = sum(v for k, v in soc.items() if k.endswith("followers") and isinstance(v, (int, float)))
-            mapping["social_followers"] = tot or None
-        rating = g("review_rating", "reviews.rating")
-        count = g("review_count", "reviews.count")
-        if rating:
-            mapping["review_rating"] = bayesian_rating(float(rating), float(count or 0))
-        if count:
-            mapping["review_count"] = count
-        for sid, v in mapping.items():
-            if v is not None and sid != "employees":
-                self.db.snap(cid, sid, v, source=source)
-        # financial facts are stored raw for triangulation
-        facts = {
-            "reported_revenue": g("revenue_reported_usd") or (g("revenue.value_usd") if (g("revenue.type") or "") in
-                                                              ("reported",) else None),
-            "reported_source": g("revenue_source_url", "revenue.source_url"),
-            "inc_band": g("inc5000_revenue_band_usd"),
-            "press_estimate": g("third_party_revenue_estimate_usd") or (
-                g("revenue.value_usd") if (g("revenue.type") or "") not in ("reported", "") else None),
-            "press_source": g("third_party_source_url", "revenue.source_url"),
-            "system_sales": g("system_sales_usd") or (g("revenue.value_usd") if g("revenue.type") == "system-sales" else None),
-            "units": g("units_or_locations", "units.count", "locations.count"),
-            "auv": g("auv_usd", "revenue.auv_usd"),
-            "employees": g("employees", "employees.value"),
-            "review_count": count,
-            "growth": g("growth_rate_estimate"),
-        }
-        if facts["system_sales"] and facts["press_estimate"] == facts["system_sales"]:
-            facts["press_estimate"] = None
-        facts = {k: v for k, v in facts.items() if v not in (None, "", [])}
-        for k in ("units", "employees", "review_count"):
-            if isinstance(facts.get(k), str):
-                m = re.search(r"[\d,]+", facts[k])
-                facts[k] = float(m.group(0).replace(",", "")) if m else None
-        if isinstance(facts.get("inc_band"), list) and len(facts["inc_band"]) != 2:
-            facts.pop("inc_band")
-        old = self.db.latest_signals(cid).get("_facts") or {}
-        old.update({k: v for k, v in facts.items() if v is not None})
-        self.db.snap(cid, "_facts", None, raw=old, source=source)
+        def write(signal, value, kind="reported", *, details=None, snapshot=False, rejection=None):
+            if value is None:
+                return
+            meta = (details or {}) | {k: v for k, v in evidence.get(signal, {}).items() if v not in (None, "")}
+            url = source_url(meta.get("source_url"))
+            if not rejection and source == "llm" and signal in CITED_REVENUE and not url:
+                rejection = "Model-returned revenue requires its own HTTP(S) source URL"
+            self.db.record_claim(
+                cid, signal, value, kind=kind, source=source, source_url=url,
+                passage=meta.get("passage") if isinstance(meta.get("passage"), str) else None,
+                period=str(meta["period"]) if isinstance(meta.get("period"), (str, int)) else None,
+                published_at=publication_date(meta.get("published_at")), snapshot=snapshot, rejection=rejection)
+            if rejection:
+                rejected.append({"signal": signal, "value": value, "reason": rejection})
+                self.log(f"    ! {signal} rejected: {rejection}")
+
+        def group(key):
+            data = facts.get(key)
+            return data if isinstance(data, dict) else {}
+
+        def first(*values):
+            return next((value for value in values if value is not None), None)
+
+        def metadata(data):
+            return {"source_url": data.get("source_url"), "period": first(data.get("period"), data.get("year")),
+                    "published_at": data.get("published_at"), "passage": data.get("passage") or data.get("note")}
+
+        own = facts.get("ownership")
+        if isinstance(own, str) and own:
+            own_text = re.sub(r"\b(no|not|never|without|explicitly no)\s+(outside\s+)?(vc|pe|private equity|venture|"
+                              r"institutional|investors?|funding|equity)\b", " ", own.lower())
+            founder = any(w in own_text for w in ("founder", "family", "bootstrap", "self-funded"))
+            institutional = any(w in own_text for w in ("pe_backed", "vc_backed", "private equity", "strategic",
+                                                        "public", "acquired", "vc", "venture", "growth-backed", "series"))
+            if institutional or founder:
+                write("founder_owned", founder and not institutional, "judgment", snapshot=True,
+                      details={"passage": own})
+
+        reviews, social = group("reviews"), group("social")
+        rating = first(facts.get("review_rating"), reviews.get("rating"))
+        count = first(facts.get("review_count"), reviews.get("count"))
+        if isinstance(count, str):
+            match = re.search(r"[\d,]+", count)
+            count = int(match.group(0).replace(",", "")) if match else count
+        if rating is not None:
+            error = signal_error("review_rating", rating)
+            valid_count = count if count is not None and not signal_error("review_count", count) else None
+            write("review_rating", rating if error else bayesian_rating(rating, valid_count), snapshot=True,
+                  rejection=error, details=metadata(reviews) | {
+                      "passage": f"Raw rating: {rating}. Review count used for Bayesian adjustment: {valid_count}."})
+        if count is not None:
+            write("review_count", count, snapshot=True, rejection=signal_error("review_count", count),
+                  details=metadata(reviews))
+
+        followers = facts.get("social_followers_total")
+        if followers is None:
+            counts = [v for k, v in social.items() if k.endswith("followers") and valid_number(v)]
+            followers = sum(counts) if counts else None
+        signals = {
+            "capital_raised": facts.get("capital_raised_usd"),
+            "new_locations_12m": facts.get("new_locations_or_doors_12m"),
+            "social_followers": followers,
+            "press_velocity": facts.get("press_mentions_6m"),
+            "awards": facts.get("has_growth_award"),
+            "recurring_model": facts.get("recurring_model"),
+            "revenue_growth": facts.get("growth_rate_estimate"),
+        } | {key: facts.get(key) for key in sorted(JUDGMENTS)}
+        for signal, value in signals.items():
+            if value is None:
+                continue
+            kind = ("judgment" if signal in JUDGMENTS or signal == "recurring_model"
+                    else "estimate" if signal == "revenue_growth" else "reported")
+            write(signal, value, kind, snapshot=True, rejection=signal_error(signal, value),
+                  details=metadata(social) if signal == "social_followers" else None)
+
+        rev = group("revenue")
+        rev_type = rev.get("type")
+        for signal, field, url_key, kind, nested in (
+            ("reported_revenue", "revenue_reported_usd", "revenue_source_url", "reported", rev_type == "reported"),
+            ("press_estimate", "third_party_revenue_estimate_usd", "third_party_source_url", "estimate",
+             rev_type not in (None, "", "reported", "system-sales")),
+            ("system_sales", "system_sales_usd", "system_sales_source_url", "reported", rev_type == "system-sales"),
+            ("inc_band", "inc5000_revenue_band_usd", "inc5000_source_url", "reported", False),
+        ):
+            value = facts.get(field)
+            details = {"source_url": facts.get(url_key), "period": facts.get("revenue_reported_year")
+                       if signal == "reported_revenue" else None}
+            if value is None and nested:
+                value, details = rev.get("value_usd"), metadata(rev)
+            if value is None:
+                continue
+            write(signal, value, kind, details=details, rejection=financial_input_error(signal, value))
+
+        locations = group("units") or group("locations")
+        for signal, value, details in (
+            ("units", first(facts.get("units_or_locations"), locations.get("count")), metadata(locations)),
+            ("employees", first(facts.get("employees") if not group("employees") else None,
+                                group("employees").get("value")), metadata(group("employees"))),
+            ("auv", first(facts.get("auv_usd"), rev.get("auv_usd")), None),
+        ):
+            if isinstance(value, str) and signal != "auv":
+                match = re.search(r"[\d,]+", value)
+                value = int(match.group(0).replace(",", "")) if match else value
+            if value is not None:
+                write(signal, value, details=details, rejection=financial_input_error(signal, value))
+
+        extras = facts.get("additional_claims")
+        for extra in extras if isinstance(extras, list) else []:
+            if isinstance(extra, dict) and isinstance(extra.get("signal"), str) and slugify(extra["signal"]):
+                kind = extra.get("kind")
+                if kind in KINDS:
+                    value = extra.get("value")
+                    if isinstance(value, str) or valid_number(value):
+                        write("context_" + slugify(extra["signal"]), value, kind, details=extra)
+        return rejected
 
     # ------------------------------------------------------------------ financials + scoring
+    def _claim_for_snapshot(self, cid: int, row: dict) -> int:
+        if row["claim_id"] is not None:
+            return row["claim_id"]
+        signal = row["signal"]
+        kind = ("judgment" if signal in JUDGMENTS | {"founder_owned", "recurring_model"}
+                else "estimate" if signal == "revenue_growth"
+                else "reported" if row["source"] in {"seed", "llm"} else "measured")
+        return self.db.record_claim(cid, signal, row["value"], kind=kind, source=row["source"] or "legacy",
+                                    passage="Legacy snapshot. Claim-level citation was not recorded.",
+                                    retrieved_at=row["ts"], snapshot_ts=row["ts"])
+
+    def _financial_inputs(self, cid: int, claims: list[dict] | None = None, issues: list[str] | None = None) -> dict:
+        # Old _facts snapshots contain a merged blob, so a model amount and its URL may
+        # come from different runs. Keep attributable seed amounts and flag legacy model amounts.
+        # Other numeric proxies can be used with explicit missing evidence.
+        keys = CITED_REVENUE | {"units", "employees", "auv", "review_count", "revenue_growth"}
+        accepted = {}
+        for claim in self.db.claims(cid) if claims is None else claims:
+            signal = claim["signal"]
+            if claim["rejection"] or signal not in keys or signal in accepted:
+                continue
+            error = financial_input_error(signal, claim["value"])
+            if error:
+                if issues is not None:
+                    issues.append(f"{signal} claim #{claim['id']} excluded: {error}")
+                continue
+            accepted[signal] = claim
+        legacy_keys = keys - accepted.keys()
+        if not legacy_keys:
+            return accepted
+        seen, legacy = {}, {}
+        for row in self.db.snapshot_history(cid, "_facts"):
+            raw = json.loads(row["raw"])
+            for signal in sorted(legacy_keys):
+                value = raw.get("growth" if signal == "revenue_growth" else signal)
+                if value is None or value == seen.get(signal):
+                    continue
+                # Each legacy blob included the previous blob. Attribute only actual changes.
+                seen[signal] = value
+                field = {"reported_revenue": "reported_source", "press_estimate": "press_source"}.get(signal)
+                url = source_url(raw.get(field)) if field else None
+                rejection = financial_input_error(signal, value)
+                if signal in CITED_REVENUE and row["source"] == "llm":
+                    rejection = "Legacy model revenue has no claim-specific provenance. Re-enrich to verify it."
+                claim_id = self.db.record_claim(
+                    cid, signal, value, kind="estimate" if signal in {"press_estimate", "revenue_growth"} else "reported",
+                    source=row["source"] or "legacy", source_url=url if not rejection else None,
+                    passage="Recovered from a legacy financial snapshot.", rejection=rejection,
+                    retrieved_at=row["ts"], snapshot_ts=row["ts"])
+                if not rejection:
+                    legacy[signal] = {"id": claim_id, "value": value, "source_url": url}
+        return accepted | legacy
+
+    def _financials(self, cid: int, model: str | None, observed: dict) -> tuple[dict, int | None]:
+        facts = {key: row["value"] for key, row in observed.items()}
+        for signal, key in (("reported_revenue", "reported_source"), ("press_estimate", "press_source"),
+                            ("system_sales", "system_sales_source"), ("inc_band", "inc_band_source")):
+            if signal in observed:
+                facts[key] = observed[signal]["source_url"]
+        view = triangulate(facts, model).as_dict()
+        financials = view | {"system_sales": facts.get("system_sales"), "growth": facts.get("revenue_growth")}
+        if view["mid"] is None:
+            return financials, None
+        method_inputs = {
+            "reported": ("reported_revenue",), "press_estimate": ("press_estimate",),
+            "system_sales": ("system_sales",), "inc5000_band": ("inc_band",),
+            "headcount": ("employees",), "units_x_auv": ("units", "auv"), "reviews": ("review_count",),
+        }
+        inputs = tuple(dict.fromkeys(observed[key]["id"] for method in view["methods"]
+                                     for key in method_inputs[method["method"]] if key in observed))
+        claim_id = self.db.record_claim(cid, "revenue_triangulation", view, kind="estimate", source="levi",
+                                        passage="Methods: " + ", ".join(m["method"] for m in view["methods"]),
+                                        inputs=inputs, reuse_derived=True)
+        return financials, claim_id
+
     def financials(self, cid: int) -> dict:
         row = self.db.company(cid)
-        facts = self.db.latest_signals(cid).get("_facts") or {}
-        view = triangulate(facts, row["model"])
-        self.db.snap(cid, "_financials", None, raw=view.as_dict(), source="levi")
-        return view.as_dict()
+        return self._financials(cid, row["model"], self._financial_inputs(cid))[0]
 
     def _thesis_for(self, row) -> dict:
         try:
@@ -304,43 +474,161 @@ class Levi:
     def score_company(self, cid: int):
         row = self.db.company(cid)
         thesis = self._thesis_for(row)
-        fin = self.financials(cid)
-        vals = {k: v for k, v in self.db.latest_signals(cid).items() if not k.startswith("_")}
-        facts = self.db.latest_signals(cid).get("_facts") or {}
-        if fin.get("mid"):
+        vals, claim_ids, issues = {}, {}, []
+        snapshots = self.db.signal_rows(cid)
+        latest_ids = {r["signal"]: r["claim_id"] for r in snapshots}
+        ledger = self.db.claims(cid)
+        claims = {r["id"]: r for r in ledger}
+        for snapshot in snapshots:
+            signal, value = snapshot["signal"], snapshot["value"]
+            if signal not in BY_ID:
+                continue
+            error = signal_error(signal, value)
+            claim = claims.get(snapshot["claim_id"])
+            if claim and (claim["value"] != value or claim["rejection"]):
+                error = "Snapshot does not match its accepted ledger claim"
+            if claim and signal in VELOCITIES and latest_ids.get(VELOCITIES[signal][0]) not in claim["inputs"][-1:]:
+                error = "Velocity window does not end at the latest comparable observation"
+            if error:
+                issues.append(f"{signal} excluded: {error}")
+                continue
+            vals[signal] = bool(value) if BY_ID[signal].norm == "bool" else value
+            claim_ids[signal] = self._claim_for_snapshot(cid, snapshot)
+
+        observed = self._financial_inputs(cid, ledger, issues)
+        for signal in ("review_count", "revenue_growth"):
+            # Prefer the exact accepted signal snapshot used by this score.
+            if signal in claim_ids:
+                observed[signal] = {"id": claim_ids[signal], "value": vals[signal]}
+            elif any(r["signal"] == signal for r in snapshots):
+                observed.pop(signal, None)
+        fin, revenue_id = self._financials(cid, row["model"], observed)
+        if revenue_id is not None:
             band = tuple(thesis.get("revenue_band", (5e6, 100e6)))
-            vals["revenue_fit"] = revenue_fit(fin["mid"], facts.get("growth"), band)
-            vals["revenue_confidence"] = fin["confidence"]
-            vals["margin_profile"] = fin["indicative_pnl"]["ebitda_margin"] / 0.35
-        if "founder_owned" in vals:
-            vals["founder_owned"] = bool(vals["founder_owned"])
+            growth = observed.get("revenue_growth")
+            fit = revenue_fit(fin["mid"], growth["value"] if growth else None, band)
+            for signal, value, passage, inputs in (
+                ("revenue_fit", fit, f"Fit against thesis revenue band {band}. Within band earns full credit. "
+                 "Fit decays by log distance outside it, with discounted credit for two-year projected growth.",
+                 (revenue_id, growth["id"]) if growth and growth["value"] > 0 else (revenue_id,)),
+                ("revenue_confidence", fin["confidence"], "Confidence from triangulation methods.", (revenue_id,)),
+                ("margin_profile", fin["indicative_pnl"]["ebitda_margin"] / 0.35,
+                 fin["indicative_pnl"]["basis"], ()),
+            ):
+                if value is None:
+                    continue
+                vals[signal] = value
+                claim_ids[signal] = self.db.record_claim(cid, signal, value, kind="estimate", source="levi",
+                                                         passage=passage, inputs=inputs, reuse_derived=True)
         card = score(vals, thesis.get("pillar_weights"))
-        self.db.save_score(cid, card)
+        self.db.save_score(cid, card, [claim_ids[sid] for sid, _, _ in card.contributions], issues, fin)
         return card
 
     # ------------------------------------------------------------------ memo
     def memo(self, cid: int) -> dict:
+        self.score_company(cid)
         d = self.dossier(cid)
-        out = self.llm.ask(P.memo_prompt(json.dumps(d, default=str)), P.MEMO_SCHEMA,
+        evidence = d["evidence"]
+        claims = {r["id"]: r for r in evidence["claims"] + evidence["scored_claims"]}
+        fields = ("signal", "claim", "value", "kind", "source", "source_url", "passage", "period",
+                  "published_at", "retrieved_at", "missing_evidence", "inputs")
+        context = json.dumps({
+            "company": d["company"], "score": d["score"],
+            "claims": {i: {key: r[key] for key in fields} for i, r in claims.items()},
+            "rejections": [{key: r[key] for key in ("signal", "rejection")} for r in evidence["rejections"]],
+            "validation_issues": evidence["validation_issues"],
+        }, ensure_ascii=False)
+        prompt = P.challenge_prompt(context)
+        basis = DB.key(prompt, P.CHALLENGE_SCHEMA)
+        challenge = d["challenge"] or {}
+        pending = not d["memo"] or d["memo_challenge"]
+        if not pending or challenge.get("basis") != basis:
+            challenge = self._review(prompt, basis, set(claims), evidence)
+        challenge_ts = self.db.snap(cid, "_challenge", None, raw=challenge, source=self.llm.backend)
+        out = self.llm.ask(P.memo_prompt(context, json.dumps(challenge)), P.MEMO_SCHEMA,
                            purpose="memo", tier="deep", web=False, system=P.SYSTEM)
-        self.db.snap(cid, "_memo", None, raw=out, source=self.llm.backend)
+        self._validate_memo(out, challenge)
+        self.db.snap(cid, "_memo", None, raw={"challenge_ts": challenge_ts, "memo": out}, source=self.llm.backend)
         return out
+
+    def _review(self, prompt: str, basis: str, claims: set[int], evidence: dict) -> dict:
+        review = self.llm.ask(prompt, P.CHALLENGE_SCHEMA, purpose="challenge",
+                              tier="deep", web=True, system=P.SYSTEM)
+        objections = review.get("objections") if isinstance(review, dict) else None
+        if not isinstance(objections, list):
+            raise LLMError("Challenge did not return an objections list")
+        for item in objections:
+            if (not isinstance(item, dict) or item.get("kind") not in P.OBJECTION_KINDS
+                    or not isinstance(item.get("concern"), str) or not item["concern"].strip()
+                    or not isinstance(item.get("claim_ids"), list)
+                    or any(type(i) is not int or i not in claims for i in item["claim_ids"])):
+                raise LLMError("Challenge returned an invalid objection or unknown claim ID")
+        missing = [r["id"] for r in evidence["scored_without_source"] if not r["inputs"]]
+        if missing:
+            objections = objections + [{"kind": "missing_evidence", "claim_ids": missing,
+                                         "concern": "These scoring inputs have no direct source URL."}]
+        if evidence["validation_issues"]:
+            objections = objections + [{"kind": "unsupported_claim", "claim_ids": [],
+                                         "concern": " ".join(evidence["validation_issues"])}]
+        return {"objections": [item | {"id": f"C{n}"} for n, item in enumerate(objections, 1)],
+                "evidence_ids": sorted(claims), "basis": basis}
+
+    @staticmethod
+    def _validate_memo(memo, challenge: dict) -> None:
+        if not isinstance(memo, dict):
+            raise LLMError("Memo did not return an object")
+        for key in ("headline", "thesis", "outreach_hook"):
+            if not isinstance(memo.get(key), str):
+                raise LLMError(f"Memo did not return {key}")
+        for key in ("why_now", "value_creation", "key_risks", "diligence_questions"):
+            if not isinstance(memo.get(key), list) or any(not isinstance(x, str) for x in memo[key]):
+                raise LLMError(f"Memo did not return {key} as a list of strings")
+        remaining = {item["id"] for item in challenge["objections"]}
+        responses = memo.get("challenge_responses")
+        if not isinstance(responses, list):
+            raise LLMError("Memo did not return objection responses")
+        for item in responses:
+            if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                    or item["id"] not in remaining or item.get("disposition") not in ("answered", "downgraded")
+                    or not isinstance(item.get("response"), str) or not item["response"].strip()):
+                raise LLMError("Memo returned an invalid or duplicate objection response")
+            remaining.remove(item["id"])
+        if remaining:
+            raise LLMError("Memo left unanswered objections: " + ", ".join(sorted(remaining)))
+
+    def stored_memo(self, cid: int, signals: dict) -> tuple[dict | None, dict | None]:
+        record = signals.get("_memo") or {}
+        if "challenge_ts" in record:
+            challenge = self.db.snapshot(cid, "_challenge", record["challenge_ts"])
+            if challenge is not None:
+                return record["memo"], challenge
+        return None, signals.get("_challenge")
 
     def dossier(self, cid: int) -> dict:
         row = self.db.company(cid)
         sig = self.db.latest_signals(cid)
         prof = json.loads(row["profile"] or "{}")
         prof.pop("site_text", None)
-        lb = [r for r in self.db.leaderboard(limit=100000) if r["id"] == cid]
+        latest = self.db.latest_score(cid)
+        scorecard = json.loads(latest["card"]) if latest else {}
+        memo, challenge = self.stored_memo(cid, sig)
+        latest_challenge = sig.get("_challenge")
+        previous_challenge = challenge if challenge != latest_challenge else None
+        reviewed_ids = tuple(dict.fromkeys(i for review in (latest_challenge, previous_challenge) if review
+                                          for i in review["evidence_ids"]))
         return {
             "company": {k: row[k] for k in ("name", "website", "city", "state", "category", "model", "ownership",
                                             "thesis", "status")},
-            "score": ({"levi_score": lb[0]["score"], "levi_alpha": lb[0]["alpha"], "coverage": lb[0]["coverage"],
-                       **json.loads(lb[0]["card"])} if lb else None),
+            "score": ({"levi_score": latest["score"], "levi_alpha": latest["alpha"], "coverage": latest["coverage"],
+                       **scorecard, "alpha_experimental": True} if latest else None),
+            "evidence": self._evidence(cid, latest, reviewed_ids=reviewed_ids),
             "signals": {k: v for k, v in sig.items() if not k.startswith("_")},
-            "financials": sig.get("_financials"),
+            "financials": (self.db.snapshot(cid, "_financials", latest["ts"])
+                           if "evidence_ids" in scorecard else sig.get("_financials")),
             "profile": prof,
-            "memo": sig.get("_memo"),
+            "memo": memo,
+            "challenge": latest_challenge,
+            "memo_challenge": previous_challenge,
         }
 
     # ------------------------------------------------------------------ the whole funnel
@@ -372,7 +660,7 @@ class Levi:
                 self.log(f"    ! {r['name']}: {e}")
             self.score_company(r["id"])
         final = self.db.leaderboard(thesis["name"], by="alpha", limit=memo_top)
-        self.log(f"[6/6] memos for top {len(final)}")
+        self.log(f"[6/6] challenges and memos for top {len(final)}")
         for r in final:
             try:
                 self.memo(r["id"])
