@@ -72,7 +72,7 @@ Regenerate legacy memos with this command to display them alongside a challenge.
 - [`docs/PLAYBOOK.md`](docs/PLAYBOOK.md): the characteristics Levi hunts for, and where real financials can be found
 - [`docs/SIGNALS_TABLE.md`](docs/SIGNALS_TABLE.md): every signal, its weight and how it's measured
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): the feature roadmap to becoming the #1 sourcing agent
-- [`data/target_list.csv`](data/target_list.csv): the current scored target list
+- [`data/target_list.csv`](data/target_list.csv): the scored target list, including experimental Levi Alpha
 
 ## Tests
 

@@ -208,8 +208,9 @@ def serp_rank(http: Http, key: str | None, domain: str | None, keywords: list[st
         pos = next((r["position"] for r in j.get("organic_results", []) if domain in r.get("link", "")), None)
         ranks[kw] = pos or 31
         urls.append(url)
-        local_hit |= any(domain in (p.get("website") or "") for p in j.get("local_results", {}).get("places", [])
-                         if isinstance(j.get("local_results"), dict))
+        local = j.get("local_results")
+        if isinstance(local, dict):
+            local_hit |= any(domain in (p.get("website") or "") for p in local.get("places", []))
     if not ranks:
         return {}, {}
     return ({"google_rank": sum(ranks.values()) / len(ranks), "local_pack": local_hit},

@@ -91,7 +91,7 @@ def evidence_md(evidence: dict) -> str:
     if evidence["validation_issues"]:
         lines += ["", "**Validation findings**", ""]
         lines += [f"- {issue}" for issue in evidence["validation_issues"]]
-    all_rows = {r["id"]: r for r in claims + evidence["scored_claims"]}
+    all_rows = {r["id"]: r for r in claims + evidence["scored_claims"] + evidence["reviewed_claims"]}
     if all_rows:
         lines += ["", "**Claims and citations**", ""]
     for r in sorted(all_rows.values(), key=lambda r: (r["signal"], -r["id"])):
@@ -107,6 +107,12 @@ def evidence_md(evidence: dict) -> str:
         lines.append(f"- #{r['id']} **{r['claim']}** ({r['kind']}): {value}. {r['source']}, {times}."
                      f"{links} {r['passage'] or ''} {citation}".strip())
     return "\n".join(lines)
+
+
+def _objection_lines(challenge: dict) -> list[str]:
+    return [f"- **{item['id']} · {item['kind'].replace('_', ' ')}:** {item['concern']}"
+            + (f" (claims {', '.join(f'#{i}' for i in item['claim_ids'])})" if item["claim_ids"] else "")
+            for item in challenge["objections"]] or ["No objections raised."]
 
 
 def dossier_md(d: dict) -> str:
@@ -152,9 +158,11 @@ def dossier_md(d: dict) -> str:
     L += ["## Evidence", "", evidence_md(d["evidence"]) if "evidence" in d else "No evidence ledger.", ""]
     L += ["## Challenge", ""]
     if challenge := d.get("challenge"):
-        L += [f"- **{item['id']} · {item['kind'].replace('_', ' ')}:** {item['concern']}"
-              + (f" (claims {', '.join(f'#{i}' for i in item['claim_ids'])})" if item["claim_ids"] else "")
-              for item in challenge["objections"]] or ["No objections raised."]
+        if previous := d.get("memo_challenge"):
+            L += ["**Latest challenge awaiting a memo**", "", *_objection_lines(challenge), "",
+                  "**Challenge addressed by the saved memo**", "", *_objection_lines(previous)]
+        else:
+            L += _objection_lines(challenge)
     else:
         L += ["No stored challenge. Running `levi memo` creates one before drafting."]
     L.append("")

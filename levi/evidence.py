@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from .signals import BY_ID
 
 KINDS = ("measured", "reported", "estimate", "judgment")
+CITED_REVENUE = {"reported_revenue", "press_estimate", "system_sales", "inc_band"}
 JUDGMENTS = {
     "institutional_awareness", "succession_signal", "fragmented_market", "product_talkability",
     "category_tailwind", "pricing_power", "fad_risk", "legal_regulatory", "key_person", "review_integrity",
@@ -21,11 +22,15 @@ def iso_time(timestamp: float) -> str:
 
 
 def source_url(value) -> str | None:
-    if not isinstance(value, str) or any(c.isspace() for c in value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if any(c.isspace() for c in value):
         return None
     try:
         url = urlsplit(value)
-        if url.scheme in {"http", "https"} and url.hostname and url.username is None:
+        if (url.scheme in {"http", "https"} and url.hostname and url.username is None
+                and (url.port is None or url.port > 0)):
             return value
     except ValueError:
         pass
@@ -60,7 +65,20 @@ def signal_error(signal: str, value) -> str | None:
     return None
 
 
-def evidence_summary(rows: list[dict], scored_ids: list[int]) -> dict:
+def financial_input_error(signal: str, value) -> str | None:
+    if signal == "inc_band":
+        if (isinstance(value, list) and len(value) == 2 and all(valid_number(v) for v in value)
+                and 0.01 <= value[0] <= value[1]):
+            return None
+        return "Expected a positive ordered USD range"
+    if signal in CITED_REVENUE or signal == "auv":
+        if valid_number(value) and value >= 0.01:
+            return None
+        return "Expected a dollar amount of at least one cent"
+    return signal_error(signal, value)
+
+
+def evidence_summary(rows: list[dict], scored_ids: list[int], reviewed_ids: tuple[int, ...] = ()) -> dict:
     by_id = {row["id"]: row for row in rows}
     latest, rejected = {}, {}
     for row in rows:
@@ -98,6 +116,7 @@ def evidence_summary(rows: list[dict], scored_ids: list[int]) -> dict:
         "source_url_count": sourced,
         "source_url_coverage": sourced / len(claims) if claims else None,
         "scored_claims": list(scored.values()),
+        "reviewed_claims": [by_id[i] for i in reviewed_ids if i in by_id],
         "scored_without_source": [r for r in scored.values() if r["missing_evidence"]],
         "rejections": list(rejected.values()),
         "validation_issues": issues,

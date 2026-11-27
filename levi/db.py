@@ -192,9 +192,22 @@ class DB:
                      period: str | None = None, published_at: str | None = None,
                      retrieved_at: float | None = None, rejection: str | None = None,
                      inputs: tuple[int, ...] = (), snapshot: bool = False,
-                     snapshot_ts: float | None = None) -> int:
+                     snapshot_ts: float | None = None, reuse_derived: bool = False) -> int:
         """Append evidence, atomically with its numeric snapshot when it drives a signal."""
+        try:
+            encoded = json.dumps(value, default=str, allow_nan=False)
+        except ValueError:
+            encoded = json.dumps(str(value))
+        dependencies = json.dumps(inputs)
         with self.conn.transaction() as conn:
+            if reuse_derived:
+                prior = conn.execute(
+                    """SELECT id FROM claims WHERE company_id=? AND signal=? AND kind=? AND source=? AND
+                       value=? AND inputs=? AND passage IS ? AND rejection IS NULL
+                       ORDER BY id DESC LIMIT 1""", (cid, signal, kind, source, encoded, dependencies, passage)
+                ).fetchone()
+                if prior:
+                    return prior["id"]
             now = time.time()
             if snapshot and not rejection:
                 snapshot_ts = now
@@ -204,9 +217,9 @@ class DB:
                       period,published_at,retrieved_at,missing_evidence,rejection,inputs,snapshot_ts)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(company_id, signal, snapshot_ts) DO NOTHING""",
-                (cid, signal, claim or signal.replace("_", " "), json.dumps(value, default=str), kind,
+                (cid, signal, claim or signal.replace("_", " "), encoded, kind,
                  source, source_url, passage, period, published_at, now if retrieved_at is None else retrieved_at,
-                 int(source_url is None), rejection, json.dumps(inputs), snapshot_ts))
+                 int(source_url is None), rejection, dependencies, snapshot_ts))
             if cur.rowcount:
                 return cur.lastrowid
             return conn.execute("SELECT id FROM claims WHERE company_id=? AND signal=? AND snapshot_ts=?",
@@ -274,7 +287,7 @@ class DB:
 
     def snapshot_history(self, cid: int, signal: str) -> list[dict]:
         rows = self.conn.execute("""
-            SELECT s.*, c.id claim_id, c.retrieved_at FROM snapshots s
+            SELECT s.*, c.id claim_id, c.retrieved_at, c.source_url, c.passage FROM snapshots s
             LEFT JOIN claims c ON c.company_id=s.company_id AND c.signal=s.signal AND c.snapshot_ts=s.ts
             WHERE s.company_id=? AND s.signal=? ORDER BY s.ts""", (cid, signal))
         return [dict(r) for r in rows]

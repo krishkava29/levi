@@ -21,16 +21,16 @@ from . import collectors as C
 from . import prompts as P
 from .config import Settings
 from .db import DB, slugify
-from .evidence import JUDGMENTS, evidence_summary, iso_time, publication_date, signal_error, source_url, valid_number
+from .evidence import (CITED_REVENUE, JUDGMENTS, KINDS, evidence_summary, financial_input_error, iso_time,
+                       publication_date, signal_error, source_url, valid_number)
 from .financials import triangulate
 from .http import Http
 from .llm import LLM, BudgetExceeded, LLMError
 from .scoring import bayesian_rating, revenue_fit, score
 from .signals import BY_ID
 
-CITED_REVENUE = {"reported_revenue", "press_estimate", "system_sales", "inc_band"}
-
 THESIS_DIR = Path(__file__).parent / "theses"
+VELOCITIES = {"social_growth_90d": ("social_followers", 90), "review_velocity": ("review_count", 30)}
 
 
 def load_thesis(name_or_path: str) -> dict:
@@ -178,12 +178,13 @@ class Levi:
             passage = json.dumps({k: v for k, v in raw.items()
                                   if k not in {"source_url", "period", "retrieved_at", "text"}})
             for sid, value in observed.items():
-                rejection = signal_error(sid, value) if sid in values else None
+                numeric = sid in values or sid in {"hn_hits", "reddit_posts_12m"}
+                rejection = signal_error(sid, value) if numeric else None
                 claim_id = self.db.record_claim(cid, sid, value, kind="measured", source=collector, source_url=url,
                                                 period=raw.get("period") or iso_time(retrieved_at),
                                                 retrieved_at=retrieved_at, passage=passage, snapshot=sid in values,
                                                 rejection=rejection)
-                if sid in {"hn_hits", "reddit_posts_12m"}:
+                if sid in {"hn_hits", "reddit_posts_12m"} and not rejection:
                     community.append((claim_id, value))
                 if sid in values and not rejection:
                     found[sid] = value
@@ -205,9 +206,9 @@ class Levi:
         row = self.db.latest_score(cid) if as_of is None else None
         return self._evidence(cid, row, as_of=as_of)
 
-    def _evidence(self, cid: int, row, *, as_of: float | None = None) -> dict:
+    def _evidence(self, cid: int, row, *, as_of: float | None = None, reviewed_ids: tuple[int, ...] = ()) -> dict:
         scorecard = json.loads(row["card"]) if row else {}
-        evidence = evidence_summary(self.db.claims(cid, as_of=as_of), scorecard.get("evidence_ids", []))
+        evidence = evidence_summary(self.db.claims(cid, as_of=as_of), scorecard.get("evidence_ids", []), reviewed_ids)
         evidence["validation_issues"].extend(scorecard.get("validation_issues", []))
         if row and "evidence_ids" not in scorecard:
             evidence["validation_issues"].append("Legacy score has no pinned evidence. Re-run levi score.")
@@ -215,13 +216,18 @@ class Levi:
 
     def _velocity(self, cid: int) -> None:
         """Turn repeated snapshots into growth signals (the reason to keep watching)."""
-        for level, growth, days_scaled in (("social_followers", "social_growth_90d", 90),
-                                           ("review_count", "review_velocity", 30)):
+        for growth, (level, days_scaled) in VELOCITIES.items():
             history = [r for r in self.db.snapshot_history(cid, level) if r["value"] is not None]
             if len(history) < 2:
                 continue
             end = history[-1]
-            comparable = [r for r in history if r["source"] == end["source"]]
+            def scope(row):
+                query = json.loads(row["passage"]).get("query") if row["source"] == "places" and row["passage"] else None
+                return row["source"], row["source_url"], query
+
+            if not end["source_url"]:
+                continue
+            comparable = [r for r in history if scope(r) == scope(end)]
             start = min(comparable, key=lambda r: r["retrieved_at"] or r["ts"])
             t0, t1 = (r["retrieved_at"] or r["ts"] for r in (start, end))
             v0, v1 = start["value"], end["value"]
@@ -246,6 +252,7 @@ class Levi:
         if not isinstance(out, dict):
             raise LLMError("Enrichment did not return a fact sheet")
         rejections = self._apply_facts(cid, out, source="llm")
+        self._velocity(cid)
         profile = dict(out)
         if rejections:
             profile["rejected_claims"] = rejections
@@ -353,12 +360,7 @@ class Levi:
                 value, details = rev.get("value_usd"), metadata(rev)
             if value is None:
                 continue
-            if signal == "inc_band":
-                valid = (isinstance(value, list) and len(value) == 2
-                         and all(valid_number(x) for x in value) and 0 < value[0] <= value[1])
-            else:
-                valid = valid_number(value) and value > 0
-            write(signal, value, kind, details=details, rejection=None if valid else "Invalid positive revenue amount or range")
+            write(signal, value, kind, details=details, rejection=financial_input_error(signal, value))
 
         locations = group("units") or group("locations")
         for signal, value, details in (
@@ -371,13 +373,13 @@ class Levi:
                 match = re.search(r"[\d,]+", value)
                 value = int(match.group(0).replace(",", "")) if match else value
             if value is not None:
-                write(signal, value, details=details, rejection=signal_error(signal, value))
+                write(signal, value, details=details, rejection=financial_input_error(signal, value))
 
         extras = facts.get("additional_claims")
         for extra in extras if isinstance(extras, list) else []:
             if isinstance(extra, dict) and isinstance(extra.get("signal"), str) and slugify(extra["signal"]):
                 kind = extra.get("kind")
-                if kind in {"measured", "reported", "estimate", "judgment"}:
+                if kind in KINDS:
                     value = extra.get("value")
                     if isinstance(value, str) or valid_number(value):
                         write("context_" + slugify(extra["signal"]), value, kind, details=extra)
@@ -395,42 +397,47 @@ class Levi:
                                     passage="Legacy snapshot. Claim-level citation was not recorded.",
                                     retrieved_at=row["ts"], snapshot_ts=row["ts"])
 
-    def _financial_inputs(self, cid: int, claims: list[dict] | None = None) -> dict:
+    def _financial_inputs(self, cid: int, claims: list[dict] | None = None, issues: list[str] | None = None) -> dict:
         # Old _facts snapshots contain a merged blob, so a model amount and its URL may
         # come from different runs. Keep attributable seed amounts and flag legacy model amounts.
         # Other numeric proxies can be used with explicit missing evidence.
         keys = CITED_REVENUE | {"units", "employees", "auv", "review_count", "revenue_growth"}
         accepted = {}
         for claim in self.db.claims(cid) if claims is None else claims:
-            if not claim["rejection"] and claim["signal"] in keys:
-                accepted.setdefault(claim["signal"], claim)
-        if keys <= accepted.keys():
+            signal = claim["signal"]
+            if claim["rejection"] or signal not in keys or signal in accepted:
+                continue
+            error = financial_input_error(signal, claim["value"])
+            if error:
+                if issues is not None:
+                    issues.append(f"{signal} claim #{claim['id']} excluded: {error}")
+                continue
+            accepted[signal] = claim
+        legacy_keys = keys - accepted.keys()
+        if not legacy_keys:
             return accepted
-        for row in reversed(self.db.snapshot_history(cid, "_facts")):
+        seen, legacy = {}, {}
+        for row in self.db.snapshot_history(cid, "_facts"):
             raw = json.loads(row["raw"])
-            for signal in keys - accepted.keys():
+            for signal in sorted(legacy_keys):
                 value = raw.get("growth" if signal == "revenue_growth" else signal)
-                if value is None:
+                if value is None or value == seen.get(signal):
                     continue
+                # Each legacy blob included the previous blob. Attribute only actual changes.
+                seen[signal] = value
                 field = {"reported_revenue": "reported_source", "press_estimate": "press_source"}.get(signal)
-                url = source_url(raw.get(field))
-                rejection = None
+                url = source_url(raw.get(field)) if field else None
+                rejection = financial_input_error(signal, value)
                 if signal in CITED_REVENUE and row["source"] == "llm":
                     rejection = "Legacy model revenue has no claim-specific provenance. Re-enrich to verify it."
-                if signal == "inc_band":
-                    if not (isinstance(value, list) and len(value) == 2 and all(valid_number(x) for x in value)
-                            and 0 < value[0] <= value[1]):
-                        continue
-                elif signal_error(signal, value):
-                    continue
                 claim_id = self.db.record_claim(
                     cid, signal, value, kind="estimate" if signal in {"press_estimate", "revenue_growth"} else "reported",
                     source=row["source"] or "legacy", source_url=url if not rejection else None,
                     passage="Recovered from a legacy financial snapshot.", rejection=rejection,
                     retrieved_at=row["ts"], snapshot_ts=row["ts"])
                 if not rejection:
-                    accepted[signal] = {"id": claim_id, "value": value, "source_url": url}
-        return accepted
+                    legacy[signal] = {"id": claim_id, "value": value, "source_url": url}
+        return accepted | legacy
 
     def _financials(self, cid: int, model: str | None, observed: dict) -> tuple[dict, int | None]:
         facts = {key: row["value"] for key, row in observed.items()}
@@ -438,11 +445,10 @@ class Levi:
                             ("system_sales", "system_sales_source"), ("inc_band", "inc_band_source")):
             if signal in observed:
                 facts[key] = observed[signal]["source_url"]
-        view = triangulate(facts, model).as_dict() | {
-            "system_sales": facts.get("system_sales"), "growth": facts.get("revenue_growth"),
-        }
+        view = triangulate(facts, model).as_dict()
+        financials = view | {"system_sales": facts.get("system_sales"), "growth": facts.get("revenue_growth")}
         if view["mid"] is None:
-            return view, None
+            return financials, None
         method_inputs = {
             "reported": ("reported_revenue",), "press_estimate": ("press_estimate",),
             "system_sales": ("system_sales",), "inc5000_band": ("inc_band",),
@@ -452,8 +458,8 @@ class Levi:
                                      for key in method_inputs[method["method"]] if key in observed))
         claim_id = self.db.record_claim(cid, "revenue_triangulation", view, kind="estimate", source="levi",
                                         passage="Methods: " + ", ".join(m["method"] for m in view["methods"]),
-                                        inputs=inputs)
-        return view, claim_id
+                                        inputs=inputs, reuse_derived=True)
+        return financials, claim_id
 
     def financials(self, cid: int) -> dict:
         row = self.db.company(cid)
@@ -470,6 +476,7 @@ class Levi:
         thesis = self._thesis_for(row)
         vals, claim_ids, issues = {}, {}, []
         snapshots = self.db.signal_rows(cid)
+        latest_ids = {r["signal"]: r["claim_id"] for r in snapshots}
         ledger = self.db.claims(cid)
         claims = {r["id"]: r for r in ledger}
         for snapshot in snapshots:
@@ -480,13 +487,15 @@ class Levi:
             claim = claims.get(snapshot["claim_id"])
             if claim and (claim["value"] != value or claim["rejection"]):
                 error = "Snapshot does not match its accepted ledger claim"
+            if claim and signal in VELOCITIES and latest_ids.get(VELOCITIES[signal][0]) not in claim["inputs"][-1:]:
+                error = "Velocity window does not end at the latest comparable observation"
             if error:
                 issues.append(f"{signal} excluded: {error}")
                 continue
             vals[signal] = bool(value) if BY_ID[signal].norm == "bool" else value
             claim_ids[signal] = self._claim_for_snapshot(cid, snapshot)
 
-        observed = self._financial_inputs(cid, ledger)
+        observed = self._financial_inputs(cid, ledger, issues)
         for signal in ("review_count", "revenue_growth"):
             # Prefer the exact accepted signal snapshot used by this score.
             if signal in claim_ids:
@@ -499,7 +508,8 @@ class Levi:
             growth = observed.get("revenue_growth")
             fit = revenue_fit(fin["mid"], growth["value"] if growth else None, band)
             for signal, value, passage, inputs in (
-                ("revenue_fit", fit, f"Revenue range midpoint against thesis band {band}.",
+                ("revenue_fit", fit, f"Fit against thesis revenue band {band}. Within band earns full credit. "
+                 "Fit decays by log distance outside it, with discounted credit for two-year projected growth.",
                  (revenue_id, growth["id"]) if growth and growth["value"] > 0 else (revenue_id,)),
                 ("revenue_confidence", fin["confidence"], "Confidence from triangulation methods.", (revenue_id,)),
                 ("margin_profile", fin["indicative_pnl"]["ebitda_margin"] / 0.35,
@@ -509,7 +519,7 @@ class Levi:
                     continue
                 vals[signal] = value
                 claim_ids[signal] = self.db.record_claim(cid, signal, value, kind="estimate", source="levi",
-                                                         passage=passage, inputs=inputs)
+                                                         passage=passage, inputs=inputs, reuse_derived=True)
         card = score(vals, thesis.get("pillar_weights"))
         self.db.save_score(cid, card, [claim_ids[sid] for sid, _, _ in card.contributions], issues, fin)
         return card
@@ -528,7 +538,21 @@ class Levi:
             "rejections": [{key: r[key] for key in ("signal", "rejection")} for r in evidence["rejections"]],
             "validation_issues": evidence["validation_issues"],
         }, ensure_ascii=False)
-        review = self.llm.ask(P.challenge_prompt(context), P.CHALLENGE_SCHEMA, purpose="challenge",
+        prompt = P.challenge_prompt(context)
+        basis = DB.key(prompt, P.CHALLENGE_SCHEMA)
+        challenge = d["challenge"] or {}
+        pending = not d["memo"] or d["memo_challenge"]
+        if not pending or challenge.get("basis") != basis:
+            challenge = self._review(prompt, basis, set(claims), evidence)
+        challenge_ts = self.db.snap(cid, "_challenge", None, raw=challenge, source=self.llm.backend)
+        out = self.llm.ask(P.memo_prompt(context, json.dumps(challenge)), P.MEMO_SCHEMA,
+                           purpose="memo", tier="deep", web=False, system=P.SYSTEM)
+        self._validate_memo(out, challenge)
+        self.db.snap(cid, "_memo", None, raw={"challenge_ts": challenge_ts, "memo": out}, source=self.llm.backend)
+        return out
+
+    def _review(self, prompt: str, basis: str, claims: set[int], evidence: dict) -> dict:
+        review = self.llm.ask(prompt, P.CHALLENGE_SCHEMA, purpose="challenge",
                               tier="deep", web=True, system=P.SYSTEM)
         objections = review.get("objections") if isinstance(review, dict) else None
         if not isinstance(objections, list):
@@ -546,14 +570,8 @@ class Levi:
         if evidence["validation_issues"]:
             objections = objections + [{"kind": "unsupported_claim", "claim_ids": [],
                                          "concern": " ".join(evidence["validation_issues"])}]
-        challenge = {"objections": [item | {"id": f"C{n}"} for n, item in enumerate(objections, 1)],
-                     "evidence_ids": list(claims)}
-        challenge_ts = self.db.snap(cid, "_challenge", None, raw=challenge, source=self.llm.backend)
-        out = self.llm.ask(P.memo_prompt(context, json.dumps(challenge)), P.MEMO_SCHEMA,
-                           purpose="memo", tier="deep", web=False, system=P.SYSTEM)
-        self._validate_memo(out, challenge)
-        self.db.snap(cid, "_memo", None, raw={"challenge_ts": challenge_ts, "memo": out}, source=self.llm.backend)
-        return out
+        return {"objections": [item | {"id": f"C{n}"} for n, item in enumerate(objections, 1)],
+                "evidence_ids": sorted(claims), "basis": basis}
 
     @staticmethod
     def _validate_memo(memo, challenge: dict) -> None:
@@ -594,18 +612,23 @@ class Levi:
         latest = self.db.latest_score(cid)
         scorecard = json.loads(latest["card"]) if latest else {}
         memo, challenge = self.stored_memo(cid, sig)
+        latest_challenge = sig.get("_challenge")
+        previous_challenge = challenge if challenge != latest_challenge else None
+        reviewed_ids = tuple(dict.fromkeys(i for review in (latest_challenge, previous_challenge) if review
+                                          for i in review["evidence_ids"]))
         return {
             "company": {k: row[k] for k in ("name", "website", "city", "state", "category", "model", "ownership",
                                             "thesis", "status")},
             "score": ({"levi_score": latest["score"], "levi_alpha": latest["alpha"], "coverage": latest["coverage"],
                        **scorecard, "alpha_experimental": True} if latest else None),
-            "evidence": self._evidence(cid, latest),
+            "evidence": self._evidence(cid, latest, reviewed_ids=reviewed_ids),
             "signals": {k: v for k, v in sig.items() if not k.startswith("_")},
             "financials": (self.db.snapshot(cid, "_financials", latest["ts"])
                            if "evidence_ids" in scorecard else sig.get("_financials")),
             "profile": prof,
             "memo": memo,
-            "challenge": challenge,
+            "challenge": latest_challenge,
+            "memo_challenge": previous_challenge,
         }
 
     # ------------------------------------------------------------------ the whole funnel

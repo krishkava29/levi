@@ -131,6 +131,8 @@ class PipelineTests(unittest.TestCase):
             def response(url, **kwargs):
                 if "wikipedia" in url:
                     return {"query": {"pages": {"123": {}}}}
+                if "algolia" in url:
+                    return {"nbHits": None}
                 return None
 
             with mock.patch.object(levi.http, "json", side_effect=response):
@@ -142,6 +144,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(set(claim) & {"period", "published_at", "retrieved_at"},
                              {"period", "published_at", "retrieved_at"})
             self.assertEqual(evidence["source_url_coverage"], 1.0)
+            self.assertEqual([r["signal"] for r in evidence["rejections"]], ["hn_hits"])
 
     def test_enrichment_rejects_unsourced_revenue_and_labels_judgments(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +167,56 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(judgment["kind"], "judgment")
             self.assertTrue(judgment["missing_evidence"])
             self.assertTrue(any("reported_revenue rejected" in m for m in messages))
+
+    def test_legacy_seed_blob_does_not_relabel_carried_forward_model_revenue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Legacy Brand"})
+            inherited = {"reported_revenue": 99_000_000}
+            levi.db.snap(cid, "_facts", None, source="llm", raw=inherited)
+            levi.db.snap(cid, "_facts", None, source="seed", raw=inherited | {"employees": 2})
+            levi.score_company(cid)
+            self.assertEqual([m["method"] for m in levi.dossier(cid)["financials"]["methods"]], ["headcount"])
+            self.assertEqual([r["signal"] for r in levi.evidence(cid)["rejections"]], ["reported_revenue"])
+
+    def test_invalid_revenue_does_not_replace_an_accepted_amount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Example Brand"})
+            source = "https://example.com/financials"
+            for amount in (10_000_000, 1e-200):
+                with mock.patch.object(levi.llm, "ask", return_value={
+                    "revenue_reported_usd": amount, "revenue_source_url": source,
+                    "evidence": [{"signal": "reported_revenue", "source_url": None, "period": "FY2023"}],
+                }):
+                    levi.enrich(cid)
+            levi.score_company(cid)
+            evidence = levi.evidence(cid)
+            cited = next(r for r in evidence["scored_claims"] if r["signal"] == "reported_revenue")
+            self.assertEqual(cited["value"], 10_000_000)
+            self.assertEqual(cited["source_url"], source)
+            self.assertEqual(evidence["rejections"][0]["value"], 1e-200)
+
+    def test_review_velocity_requires_comparable_observations_and_records_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Example Brand"})
+            first = datetime.fromisoformat("2024-04-01T00:00:00+00:00").timestamp()
+            observations = [(10, "https://reviews.example/a"), (20, "https://reviews.example/a"),
+                            (200, "https://reviews.example/b")]
+            for i, (count, url) in enumerate(observations):
+                with mock.patch("levi.db.time.time", return_value=first + i * 86400 * 10), \
+                        mock.patch.object(levi.llm, "ask", return_value={
+                            "review_count": count, "evidence": [{"signal": "review_count", "source_url": url}],
+                        }):
+                    levi.enrich(cid)
+            latest = levi.evidence(cid)["claims"]
+            velocity = next(r for r in latest if r["signal"] == "review_velocity")
+            self.assertEqual(velocity["value"], 30)
+            self.assertIn("2024-04-01", velocity["period"])
+            self.assertIn("2024-04-11", velocity["period"])
+            self.assertEqual(len(velocity["inputs"]), 2)
+            self.assertNotIn("review_velocity", {s for s, *_ in levi.score_company(cid).contributions})
 
     def test_consumer_seed_dossier_shows_experimental_alpha_and_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +311,58 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("audited franchisor operating revenue", md)
             self.assertIn("unaudited Item 19 cohort", md)
             self.assertIn("$3,386,658", md)
+
+    def test_memo_retry_uses_the_stored_challenge_without_another_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = settings(tmp)
+            s.max_llm_calls = 1
+            s.llm_cache_days = 0
+            levi = Levi(s, log=lambda m: None)
+            levi.import_seeds(str(HOUNDS_FIXTURE))
+            cid = levi.db.company("Hounds Town USA")["id"]
+            with mock.patch.object(levi.llm, "_codex", return_value={"objections": []}):
+                with self.assertRaises(BudgetExceeded):
+                    levi.memo(cid)
+            self.assertIsNotNone(levi.dossier(cid)["challenge"])
+
+            levi = Levi(s, log=lambda m: None)
+            memo = {"headline": "Diligence required", "thesis": "Historical data", "why_now": [],
+                    "value_creation": [], "key_risks": [], "diligence_questions": [], "outreach_hook": "",
+                    "challenge_responses": [
+                        {"id": "C1", "disposition": "downgraded", "response": "Margin is only a benchmark."},
+                    ]}
+            with mock.patch.object(levi.llm, "_codex", return_value=memo) as model:
+                self.assertEqual(levi.memo(cid), memo)
+            self.assertIn("Stored challenge", model.call_args.args[0])
+            self.assertEqual(levi.llm.calls, 1)
+
+    def test_pending_review_keeps_prior_memo_and_its_cited_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Example Brand"})
+            with mock.patch.object(levi.llm, "ask", return_value={"pricing_power": 0.7}):
+                levi.enrich(cid)
+            prior_id = levi.evidence(cid)["claims"][0]["id"]
+            challenge = {"objections": [{"kind": "unsupported_claim", "concern": "Pricing power needs evidence.",
+                                         "claim_ids": [prior_id]}]}
+            memo = {"headline": "Prior memo", "thesis": "Pricing power unproven", "why_now": [],
+                    "value_creation": [], "key_risks": [], "diligence_questions": [], "outreach_hook": "",
+                    "challenge_responses": [
+                        {"id": f"C{i}", "disposition": "downgraded", "response": "Pricing power needs evidence."}
+                        for i in (1, 2)
+                    ]}
+            with mock.patch.object(levi.llm, "ask", side_effect=[challenge, memo]):
+                levi.memo(cid)
+            with mock.patch.object(levi.llm, "ask", return_value={"pricing_power": 0.3}):
+                levi.enrich(cid)
+            with mock.patch.object(levi.llm, "ask", side_effect=[{"objections": []}, BudgetExceeded("limit")]):
+                with self.assertRaises(BudgetExceeded):
+                    levi.memo(cid)
+            dossier = levi.dossier(cid)
+            self.assertEqual(dossier["memo"]["headline"], "Prior memo")
+            self.assertEqual(dossier["memo_challenge"]["objections"][0]["claim_ids"], [prior_id])
+            self.assertIn(prior_id, {r["id"] for r in dossier["evidence"]["reviewed_claims"]})
+            self.assertIn("Latest challenge awaiting a memo", dossier_md(dossier))
 
     def test_as_of_evidence_excludes_later_publication_and_its_derivations(self):
         with tempfile.TemporaryDirectory() as tmp:
