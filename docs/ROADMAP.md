@@ -5,7 +5,7 @@ partner in front of a great founder-owned business earlier, with better informat
 
 ## Shipped in v0.1 (this repo)
 
-- **Characteristic-based scoring.** 40 signals in 8 pillars produce a Levi Score and a **Levi Alpha** (score discounted by how shopped the company already is).
+- **Characteristic-based scoring.** 40 signals in 8 pillars produce a Levi Score and a **Levi Alpha (experimental)** (score discounted by how shopped the company already is).
 - **Trajectory fit.** A company under the revenue floor still scores if its growth puts it in the band within 24 months.
 - **AI share-of-voice probe.** Measures whether ChatGPT and other assistants recommend the company. Names the AI recommends that Levi isn't tracking yet become new leads.
 - **Revenue triangulation** with an audit trail and an indicative, benchmark-labelled P&L.

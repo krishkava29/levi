@@ -91,12 +91,13 @@ def collect_estimates(facts: dict, model: str | None) -> list[Estimate]:
                             "on-record figure", facts.get("reported_source")))
     if facts.get("inc_band"):
         lo, hi = facts["inc_band"]
-        out.append(Estimate("inc5000_band", float(lo), float(hi), PRIOR_CONF["inc5000_band"], "Inc. 5000 band"))
+        out.append(Estimate("inc5000_band", float(lo), float(hi), PRIOR_CONF["inc5000_band"],
+                            "Inc. 5000 band", facts.get("inc_band_source")))
     if facts.get("system_sales"):
         s = float(facts["system_sales"])
         # franchisor revenue ~ royalties+fees (8-12% of system sales) + company-owned units
         out.append(Estimate("system_sales", s * 0.08, s * 0.25, PRIOR_CONF["system_sales"],
-                            f"franchisor take on ${s/1e6:.0f}M system sales"))
+                            f"franchisor take on ${s/1e6:.0f}M system sales", facts.get("system_sales_source")))
     if facts.get("units"):
         auv = float(facts.get("auv") or b.get("auv") or 0)
         if auv:

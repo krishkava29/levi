@@ -15,8 +15,9 @@ npm i -g @openai/codex && codex login        # use your ChatGPT/Codex plan
 pip install -e .                             # stdlib only, no dependencies
 levi doctor                                  # checks backend and optional keys
 levi import data/seeds/*.json                # 46 researched targets to start from
-levi top                                     # leaderboard by Levi Alpha
+levi top                                     # leaderboard by experimental Levi Alpha
 levi show "Branch Basics" --md               # full dossier
+levi evidence "Branch Basics"                # claims, citations, and evidence gaps
 levi run multi-site-services                 # discover -> AI probe -> collect -> score -> enrich -> memo
 levi run "independent veterinary clinics in Texas" --max-llm-calls 25
 ```
@@ -37,15 +38,21 @@ free collectors (0 tokens):       │   website, socials, ATS job boards, Waybac
 score (0 tokens)                 ─┤
 deep enrich top-K (LLM + web)    ─┤   1 call per shortlisted company
 revenue triangulation (0 tokens) ─┤
-memo top-N (LLM)                 ─┘   1 call per finalist
+challenge + memo top-N (LLM)     ─┘   2 calls per finalist
 ```
 
 **Levi Score** blends 8 pillars (love, heat, discover, velocity, moat, dealability, financial, risk).
 Each thesis sets its own weights.
-**Levi Alpha** = Levi Score × how *unknown* the company is to institutional buyers. This is the
-proprietary-deal number.
+**Levi Alpha (experimental)** = Levi Score × institutional-unawareness factor × founder factor.
+The dossier shows each factor.
 **Trajectory fit**: a $4M company doubling every year scores as if it is in a $10–100M band, because in
 24 months it will be.
+
+`levi evidence <company> --json` includes accepted claims, the evidence pinned to the score,
+and rejected inputs. Use `--as-of YYYY-MM-DD` to inspect evidence available by the end of a UTC date.
+Historical queries use retrieval time and source publication dates when known.
+`levi memo <company>` stores a challenge before drafting and requires a response to each objection.
+Regenerate legacy memos with this command to display them alongside a challenge.
 
 ## Why it's cheap to run
 

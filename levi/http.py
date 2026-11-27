@@ -4,12 +4,17 @@ from __future__ import annotations
 import gzip
 import json
 import re
+import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
 from html import unescape
 
 from .config import Settings
 from .db import DB
+
+_retrievals: ContextVar[list[float] | None] = ContextVar("http_retrievals", default=None)
 
 
 class Http:
@@ -17,14 +22,26 @@ class Http:
         self.s = settings
         self.db = db
 
+    @contextmanager
+    def capture_retrievals(self):
+        times = []
+        token = _retrievals.set(times)
+        try:
+            yield times
+        finally:
+            _retrievals.reset(token)
+
     def get(self, url: str, *, headers: dict | None = None, data: bytes | None = None,
             cache_days: float | None = None, timeout: int = 20) -> tuple[int, str]:
         ttl = self.s.http_cache_days if cache_days is None else cache_days
         key = DB.key("http", url, headers, data)
         if ttl > 0:
-            hit = self.db.cache_get(key, ttl)
+            hit = self.db.cache_get(key, ttl, with_timestamp=True)
             if hit is not None:
-                return hit[0], hit[1]
+                (status, text), retrieved_at = hit
+                if (times := _retrievals.get()) is not None:
+                    times.append(retrieved_at)
+                return status, text
         h = {"User-Agent": self.s.user_agent, "Accept-Encoding": "gzip"}
         h.update(headers or {})
         req = urllib.request.Request(url, headers=h, data=data)
@@ -38,8 +55,12 @@ class Http:
             status, text = e.code, ""
         except Exception:  # network errors are data, not crashes
             return 0, ""
-        if ttl > 0 and status == 200:
-            self.db.cache_put(key, [status, text])
+        if status == 200:
+            retrieved_at = time.time()
+            if (times := _retrievals.get()) is not None:
+                times.append(retrieved_at)
+            if ttl > 0:
+                self.db.cache_put(key, [status, text], ts=retrieved_at)
         return status, text
 
     def json(self, url: str, **kw):

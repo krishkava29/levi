@@ -1,18 +1,23 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 from levi import financials as F
 from levi.config import Settings
-from levi.llm import LLM, BudgetExceeded, extract_json, strict_schema
+from levi.llm import LLM, BudgetExceeded, LLMError, extract_json, strict_schema
 from levi.pipeline import Levi, load_thesis
+from levi.report import dossier_md
 from levi.scoring import bayesian_rating, revenue_fit, score
 from levi.signals import BY_ID, SIGNALS
 
 ROOT = Path(__file__).resolve().parents[1]
+HOUNDS_FIXTURE = ROOT / "tests/fixtures/hounds_town_fdd.json"
 
 
 def settings(tmp):
@@ -118,6 +123,175 @@ class LLMTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_collector_keeps_measured_evidence_with_the_request_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Example Brand"})
+
+            def response(url, **kwargs):
+                if "wikipedia" in url:
+                    return {"query": {"pages": {"123": {}}}}
+                return None
+
+            with mock.patch.object(levi.http, "json", side_effect=response):
+                levi.collect_free(cid)
+            evidence = levi.evidence(cid)
+            claim = next(c for c in evidence["claims"] if c["signal"] == "wikipedia_page")
+            self.assertEqual(claim["kind"], "measured")
+            self.assertIn("titles=Example%20Brand", claim["source_url"])
+            self.assertEqual(set(claim) & {"period", "published_at", "retrieved_at"},
+                             {"period", "published_at", "retrieved_at"})
+            self.assertEqual(evidence["source_url_coverage"], 1.0)
+
+    def test_enrichment_rejects_unsourced_revenue_and_labels_judgments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            messages = []
+            levi = Levi(settings(tmp), log=messages.append)
+            cid = levi.db.upsert_company({"name": "Example Franchise", "model": "franchisor"})
+            with mock.patch.object(levi.llm, "ask", return_value={
+                "revenue_reported_usd": 99_000_000,
+                "third_party_revenue_estimate_usd": 88_000_000,
+                "system_sales_usd": 77_000_000,
+                "pricing_power": 0.7,
+                "fad_risk": 1.5,
+            }):
+                levi.enrich(cid)
+            self.assertIsNone(levi.financials(cid)["mid"])
+            evidence = levi.evidence(cid)
+            self.assertEqual({r["signal"] for r in evidence["rejections"]},
+                             {"reported_revenue", "press_estimate", "system_sales", "fad_risk"})
+            judgment = next(c for c in evidence["claims"] if c["signal"] == "pricing_power")
+            self.assertEqual(judgment["kind"], "judgment")
+            self.assertTrue(judgment["missing_evidence"])
+            self.assertTrue(any("reported_revenue rejected" in m for m in messages))
+
+    def test_consumer_seed_dossier_shows_experimental_alpha_and_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            self.assertEqual(levi.import_seeds(str(ROOT / "data/seeds/consumer_brands.json")), 12)
+            cid = levi.db.companies()[0]["id"]
+            card = levi.score_company(cid)
+            dossier = levi.dossier(cid)
+            breakdown = dossier["score"]["alpha_breakdown"]
+            self.assertEqual(round(breakdown["fit"] * breakdown["institutional_unawareness_factor"]
+                                   * breakdown["founder_factor"], 1), card.alpha)
+            self.assertTrue(dossier["evidence"]["scored_claims"])
+            self.assertFalse(dossier["evidence"]["validation_issues"])
+            md = dossier_md(dossier)
+            self.assertIn("Levi Alpha (experimental)", md)
+            self.assertIn("## Evidence", md)
+            self.assertIn("## Challenge", md)
+
+    def test_memo_requires_a_stored_challenge_and_addresses_each_objection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Example Brand"})
+            challenge = {"objections": [{"kind": "reason_to_pass", "concern": "Customer retention is unknown.",
+                                         "claim_ids": []}]}
+            with mock.patch.object(levi.llm, "ask", side_effect=LLMError("challenge failed")) as ask:
+                with self.assertRaises(LLMError):
+                    levi.memo(cid)
+            self.assertEqual([c.kwargs["purpose"] for c in ask.call_args_list], ["challenge"])
+            self.assertIsNone(levi.dossier(cid)["memo"])
+
+            def respond(prompt, schema, *, purpose, **kwargs):
+                if purpose == "challenge":
+                    return challenge
+                self.assertIn("Customer retention is unknown", prompt)
+                self.assertIsNotNone(levi.dossier(cid)["challenge"])
+                return {"headline": "Investigate", "thesis": "Early screen", "why_now": [],
+                        "value_creation": [], "key_risks": [], "diligence_questions": [], "outreach_hook": "",
+                        "challenge_responses": []}
+
+            with mock.patch.object(levi.llm, "ask", side_effect=respond):
+                with self.assertRaisesRegex(LLMError, "objection"):
+                    levi.memo(cid)
+            self.assertIsNone(levi.dossier(cid)["memo"])
+
+    def test_hounds_town_fdd_keeps_period_scope_and_audit_status_in_memo_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            simulated_retrieval = datetime.fromisoformat("2024-04-22T16:00:00+00:00").timestamp()
+            with mock.patch("levi.db.time.time", return_value=simulated_retrieval):
+                levi.import_seeds(str(HOUNDS_FIXTURE))
+            cid = levi.db.company("Hounds Town USA")["id"]
+            self.assertFalse(levi.evidence(cid, as_of=simulated_retrieval - 1)["claims"])
+            claims = {r["signal"]: r for r in levi.evidence(cid, as_of=simulated_retrieval)["claims"]}
+            self.assertEqual(claims["units"]["value"], 55)
+            self.assertEqual(claims["context_outlet-reporting-group"]["value"], 37)
+            self.assertEqual(claims["reported_revenue"]["value"], 3_386_658)
+            self.assertEqual(claims["context_franchisor-net-loss-usd"]["value"], -735_854)
+            self.assertEqual(claims["reported_revenue"]["period"], "FY2023")
+            self.assertEqual(claims["reported_revenue"]["published_at"], "2024-04-20")
+            self.assertNotIn("system_sales", claims)
+
+            source = claims["reported_revenue"]["source_url"]
+
+            def respond(prompt, schema, *, purpose, **kwargs):
+                for detail in ("2023-12-31", "FY2023", "unaudited", "audited Statements of Operations",
+                               "Item 19", "Item 21", "B-7", source):
+                    self.assertIn(detail, prompt)
+                if purpose == "challenge":
+                    return {"objections": [{"kind": "contradiction", "concern": "Do not generalize the outlet sample.",
+                                             "claim_ids": [claims["context_outlet-reporting-group"]["id"]]}]}
+                return {
+                    "headline": "Require current financials",
+                    "thesis": f"FY2023 audited franchisor operating revenue was ${3_386_658:,}, with a "
+                              f"${735_854:,} net loss (Item 21, Exhibit B, p. B-7, {source}).",
+                    "why_now": [f"The unaudited Item 19 cohort covered 37 outlets. The network had 55 outlets "
+                                f"at December 31, 2023 ({source})."],
+                    "value_creation": [], "key_risks": [], "diligence_questions": [], "outreach_hook": "",
+                    "challenge_responses": [
+                        {"id": "C1", "disposition": "answered", "response": "The memo states each scope separately."},
+                        {"id": "C2", "disposition": "downgraded", "response": "Margin assumption is illustrative."},
+                    ],
+                }
+
+            with mock.patch.object(levi.llm, "ask", side_effect=respond):
+                levi.memo(cid)
+            dossier = levi.dossier(cid)
+            self.assertEqual([m["method"] for m in dossier["financials"]["methods"]], ["reported"])
+            md = dossier_md(dossier)
+            self.assertIn("Challenge responses", md)
+            self.assertIn("55 outlets", md)
+            self.assertIn("37 outlets", md)
+            self.assertIn("audited franchisor operating revenue", md)
+            self.assertIn("unaudited Item 19 cohort", md)
+            self.assertIn("$3,386,658", md)
+
+    def test_as_of_evidence_excludes_later_publication_and_its_derivations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            levi = Levi(settings(tmp), log=lambda m: None)
+            cid = levi.db.upsert_company({"name": "Example Brand"})
+            cutoff = datetime.fromisoformat("2024-04-21T23:59:59+00:00").timestamp()
+            original = levi.db.record_claim(cid, "units", 50, kind="reported", source="fixture",
+                                            source_url="https://example.com/old", published_at="2024-04-01",
+                                            retrieved_at=cutoff - 2)
+            later = levi.db.record_claim(cid, "units", 55, kind="reported", source="fixture",
+                                         source_url="https://example.com/later", published_at="2024-04-22",
+                                         retrieved_at=cutoff - 1)
+            levi.db.record_claim(cid, "revenue_triangulation", {}, kind="estimate", source="fixture",
+                                 retrieved_at=cutoff, inputs=(later,))
+            claims = levi.evidence(cid, as_of=cutoff)["claims"]
+            self.assertEqual([r["id"] for r in claims], [original])
+
+    def test_consumer_seed_cli_smoke(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ | {"LEVI_HOME": tmp}
+
+            def cli(*args):
+                proc = subprocess.run([sys.executable, "-m", "levi", *args],
+                                      cwd=ROOT, env=env, check=True, capture_output=True, text=True)
+                return proc.stdout
+
+            company = "Fishwife Tinned Seafood Co."
+            self.assertIn("imported 12 companies", cli("import", "data/seeds/consumer_brands.json"))
+            markdown = cli("show", company, "--md")
+            for phrase in ("## Evidence", "## Challenge", "institutional-unawareness factor", "Source URL coverage"):
+                self.assertIn(phrase, markdown)
+            self.assertTrue(json.loads(cli("evidence", company, "--json"))["scored_claims"])
+            self.assertIn("Alpha (experimental)", cli("top"))
+
     def test_import_seeds_and_score(self):
         with tempfile.TemporaryDirectory() as tmp:
             levi = Levi(settings(tmp), log=lambda m: None)

@@ -40,7 +40,7 @@ collects them systematically.
 
 ### F. Deal-ability (this is where the alpha is)
 19. **Founder or family owned**, with little or no institutional capital.
-20. **Low institutional awareness.** No banker process, no PE coverage, no "exploring a sale" press. **Levi Alpha** discounts the score of companies that are already shopped.
+20. **Low institutional awareness.** No banker process, no PE coverage, no "exploring a sale" press. **Levi Alpha (experimental)** discounts the score of companies that are already shopped.
 21. **Succession signals.** Long founder tenure, "next chapter" language, a second generation that may not want to run it.
 22. **Fragmented market.** Room to buy and build.
 
